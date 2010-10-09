@@ -1,0 +1,346 @@
+#!/usr/bin/perl
+
+# see usage ( its at the bottom of the script ) for help currentCostListener -h
+
+use strict;
+use Device::SerialPort;
+use FileHandle;
+use POSIX qw(setsid);
+use File::Pid;
+use Getopt::Std;
+use Data::Dumper;
+use LWP;
+
+##
+# Signals to Trap and Handle
+##
+$SIG{INT} = \&interrupt;
+$SIG{HUP} = \&interrupt;
+$SIG{ABRT} = \&interrupt;
+$SIG{QUIT} = \&interrupt;
+$SIG{TRAP} = \&interrupt;
+$SIG{STOP} = \&interrupt;
+$SIG{TERM} = \&interrupt;
+$SIG{PIPE} = 'ignore';
+
+# -------- daemonize -------------
+# chdir '/';
+umask 0;
+defined( my $pid = fork ) or die "Can't fork: $!";
+exit if $pid; # program is split at this point, $pid is 0 for the child process so exit if anything else, i.e. if its the parent it will be
+# a positive intiger, terminate and let the child continue. if pid = 0 its the spawned child process so continue.
+POSIX::setsid() or die "Can't start a new session.";
+# ----------------------------------
+
+# =============
+# = Variables =
+# =============
+# get user settings:
+my %config = do '/home/nick/currentcost/config.pl' or die "no config file found";
+# my $configFromENV = `echo \$SLOCATION`;
+# my %config = do "$configFromENV/config.pl" or die "no config file found";
+# Globals, if you need to edit these, let me know why, cheers
+my $daemonName = "currentCostListener";
+my $version = 'v1.0'; #version obviously, not used in any logic
+my $dieNow        = 0;	# used for "infinte loop" construct - allows daemon mode to gracefully exit
+my $pidFilePath   = "/var/run/";	# PID file path
+my $pidFileName       = $pidFilePath . $daemonName . ".pid";
+my $startDate;		# Start date of sampling period
+my $finishDate;		# Finish date of sampling period
+my $lastUploadTime = time;	# Last time of upload
+my $powerLevel;		# Current power level from CC unit
+my $temperature;	# Current temp level from CC unit
+my $totalPower=0;		# Total of all power readings in-loop
+my $numreads=0;		# Number of readings taken in-loop
+my $webobj;		# LWP HTTP Object
+my @uploadBuffer;		# Send buffer for all results
+my $http_timeout = 10; # HTTP Timeout (for uploading data)
+my $logFile = $config{"logFile"}.$daemonName."_".&getDateTime('date').".log"; # append logfilename to user specified log location
+my %opts;
+getopts('ChHD', \%opts);
+# ---------------------------------------
+if (defined $opts{h} or defined $opts{H}){
+	&usage(); #show help
+}
+
+# open logfile handle, hot
+open(LOG, ">>$logFile")  or  die "currentCostListener cannot open log file for appending";
+LOG->autoflush(1);
+
+# redirect default filehandles to logfile
+open STDIN,  '/dev/null' or die "Can't read /dev/null: $!";
+open STDOUT, ">>$logFile" or die "Can't write to $logFile: $!";
+open STDERR, ">>$logFile" or die "Can't write to $logFile: $!";
+
+&logit("Executing currentCostListener Daemon".$version);
+
+# PID
+# create pid file in /var/run/
+my $pidfile = File::Pid->new( { file => $pidFileName, } );
+$pidfile->write or die "Can't write PID file, /dev/null: $!";
+&logit("created PID: ".$pidFileName);
+
+# check for flags
+if (defined $opts{C}){
+	&logit("got opts -C creating variable");
+	&createVariable();
+	die "variable action complete\n";
+}
+
+# force logging
+if (defined $opts{D}){
+	$config{'logging'} = 1;
+}
+
+# Create the HTTP object
+&createHTTPobj;
+
+# access serial port
+my $ob = Device::SerialPort->new ($config{'PORT'}) || die "Can't Open $config{'PORT'}: $!";
+$ob->baudrate(57600); # this workds for the envi128 but might be different for other models, you'll get garbage output if its wrong.
+$ob->write_settings;
+
+# =========================================
+# = get data from currentcost serial port =
+# =========================================
+open(SERIAL, "+>$config{'PORT'}");
+while (my $line = <SERIAL>) {
+	&logit(&getDateTime('time')." CC_DATA (Baud:".$ob->baudrate."): ".$line);
+	exit if ($dieNow == 1);
+	# execute upload here
+	&googleUploadLoop($line);
+}
+
+# logging sub
+sub logit(){
+	return 0 unless $config{'logging'} == 1; # exit sub if logging disabled
+	my $loginfo;
+	unless ($loginfo = $_[0]){ # was anything passed to me?
+		print LOG &getDateTime('time')."currentCostListener: logging triggered without argument!";
+		die "currentCostListener script logging failure";
+	}
+	print LOG &getDateTime('time')." $loginfo\n"  or  die "currentCostListener script logging failure";
+}
+
+# google formatted date
+sub getDateTime() {
+  # Requires: date | time
+  # Returns: [0] Date/Time in Google Data format
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+  my $googledate = sprintf "%4d-%02d-%02d",$year+1900,$mon+1,$mday,$hour,$min,$sec;
+  my $googletime = sprintf "%4d-%02d-%02dT%02d:%02d:%02d.000",$year+1900,$mon+1,$mday,$hour,$min,$sec;
+    if ( $_[0] eq "time" ) { return $googletime; }
+	if ( $_[0] eq "date" ) { return $googledate; }
+  return 1;
+}
+# Interrupt: Simple interrupt handler
+sub interrupt {
+    $dieNow = 1;    # this will cause the "infinite loop" to exit, is this required if im dying anyway?
+	# print LOG "ERROR caught @_ exiting\n";
+       &logit("caught @_ exiting");
+       &logit("trying to remove lockfile...");
+    if($pidfile){
+		if ($pidfile->remove){
+			&logit("Removed lockfile");
+		}else{
+			&logit("could not remove lockfile");
+		}
+	}else{&logit("no lockfile found, parent terminating?");}
+	&logit("Terminated");
+}
+
+sub buildXML() {
+  # Build the XML format for upload (differs per type)
+  # Requires: [0] Start Date, [1] End Date, [2] Average Power
+  # Returns:  [0] Formatted XML for upload
+  if ( ! $_[2] ) {
+    die("buildXML(): wrong number of arguments!");
+  }
+  my $pdata = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<entry xmlns=\"http://www.w3.org/2005/Atom\" xmlns:meter=\"http://schemas.google.com/meter/2008\">
+<meter:startTime meter:uncertainty=\"1.0\">$_[0]</meter:startTime>
+<meter:endTime meter:uncertainty=\"1.0\">$_[1]</meter:endTime>
+<meter:quantity meter:uncertainty=\"0.001\" meter:unit=\"kW h\">$_[2]</meter:quantity>
+</entry>";
+  # Push back the correct XML ready for sending/storing
+  return $pdata;
+}
+
+sub createHTTPobj() {
+  # Create the HTTP object used for sending/receiving data to google
+  # Requires/Returns: Nothing
+  $webobj = LWP::UserAgent->new || 
+    die("Failed to create HTTP agent");
+  $webobj->agent("Mozilla/4.0 (compatible); CurrentCost Uploader V1.0)") ||
+    die("Failed to set HTTP agent name");
+  $webobj->timeout($http_timeout) ||
+    die("Failed to set HTTP agent timeout");;
+}
+
+sub pushReading() {
+  # Upload a reading to Google
+  # Requires: [0] XML data to send
+  # Returns:  [0] HTTP Object containing response
+  if ( ! $_[0] ) {
+    # Didn't get passed any data
+    die("pushReading(): no data!");
+  }
+	&logit("pushReading() sending: ".$_[0]);
+  	# Send data
+	# https://www.google.com/powermeter/feeds/user/00528190529187229408/00528190529187229408/variable/currentcost.envi.MyEnvi/durMeasurement
+  	my $httpres = $webobj->post(
+    	"https://www.google.com/powermeter/feeds/user/$config{'googleUserId'}/$config{'securityZone'}/variable/$config{'meterDeviceId'}.v1/durMeasurement",
+    	'Authorization' => 'AuthSub token="'.$config{'AuthSubToken'}.'"',
+    	'Content-type' => 'application/atom+xml',
+    	'Content-length' => length($_[0]),
+    	'Content' => $_[0]);
+	
+	&logit("Dump: ".Dumper($httpres));
+	&logit("HTTPResponse: ".$httpres->content);
+  	# Return httpres so we can check it and not remove data from the buffer if failed
+  	return $httpres;
+}
+
+sub calcAverage() {
+  # Calculate the time period covered along with the average usage
+  # Requires: [0] total power, [1] number of readings, [2] upload wait period
+  # Returns:  [0] average power suitable for Google
+  # To calculate this:
+  #   Total Power / Number of reads 	= Average
+  #   Average / 1000 			= Average kWh
+  #   3600 / ul_wait			= Sampling Divisor (usually 6 (3600/600))
+  #   Average kWh / Sampling Divisor	= Average for time period, ready for Google
+  # Calculate the correct average power usage
+  if ( ! $_[2] ) { 
+    die("calcAverage(): with wrong number of args!");
+  }
+  my $apower = sprintf("%1.6f", ($_[0]/$_[1]/1000/(3600/$_[2])));
+  return $apower;
+}
+# sends data to google
+sub googleUploadLoop(){
+	# &logit("\nexecuting google upload loop\n"); # debug
+	# This sub checks if its time to upload. You can only  upload a cetain number of times a day. see API
+	# If we don't have a stored start date, create one
+	if ( ! defined($startDate) ) {
+	  $startDate = &getDateTime('time');
+	}
+	&logit("set startDate: $startDate"); # debug
+	
+	# Grab the current power reading
+	if ($_[0] =~ m/<msg>.*<tmpr>(.*)<\/tmpr><sensor>0<\/sensor><id>04077<\/id><type>1<\/type><ch1><watts>(\d+)<\/watts><\/ch1><\/msg>/g){
+		$powerLevel = $2;
+		$temperature = $1;
+		&logit("powermeter regex: \$powerLevel:$powerLevel \$temperature:$temperature"); # debug
+	}else{ &logit("googleUploadLoop(): not valid line: $_[0]"); return 0; }
+	
+	&logit("googleUploadLoop(): Current usage: $powerLevel watts..");
+
+	# Add the level to the total and increment the counter
+	$totalPower+=$powerLevel;
+	$numreads++;
+
+	# Check if its time to upload data
+	# if current time is greater than last upload time+wait period
+	if ( time >= $lastUploadTime+$config{'uploadInterval'} ) {
+		# It's upload time!
+		&logit("googleUploadLoop(): Time to upload..");
+		# Set the finish time for this reading
+		my $finishDate = &getDateTime('time');
+		# Calculate the average power level
+		my $avglevel = &calcAverage($totalPower, $numreads, $config{'uploadInterval'});
+		# Build the XML data
+		my $gxml = &buildXML($startDate, $finishDate, $avglevel);
+		# Push the data to the send buffer
+		push(@uploadBuffer, $gxml);
+		# Send everthing in the buffer
+		my $res=0;
+		&logit("googleUploadLoop(): Attempting to upload ".scalar(@uploadBuffer)." reading(s)..");
+		foreach (@uploadBuffer) {
+			my $rstat = &pushReading($_);
+			if ( ! $rstat->is_success ) { $res++; }
+		}
+		if ( $res == 0 ) {
+			# All data uploaded (in theory)
+			&logit("googleUploadLoop(): Uploaded ".($res+1)." data set(s) successfully.");
+			# Reset all the variables
+			undef(@uploadBuffer);
+			undef($finishDate); undef($startDate);
+			undef($avglevel); undef($gxml);
+			$totalPower=0; $numreads=0;
+		} else {
+			  # Failed to upload at least 1 data record
+			  &logit("googleUploadLoop(): WARN: Failed to upload $res record(s)!");
+			  &logit("googleUploadLoop(): Will try to upload any data at next interval.");
+		}
+		# Reset the last upload time regardless of upload pass/fail
+		$lastUploadTime = time;
+	}
+	# else{
+	# 		# Don't upload yet as its too early
+	# 		&logit("(".($lastUploadTime + $config{'uploadInterval'} - time)." seconds left until upload..)");
+	# 	}
+}
+
+sub usage {
+	print "
+	# =====================================================================
+	# =================== currentcost-uploader ============================
+	# === http://code.google.com/p/currentcost-uploader/source/checkout ===
+	# ================== QUIXAND\@GMAIL.COM ===============================
+
+	# $version 2010-10-08
+	# This perl script collects data from the currentcost envi power monitor via its serial port and
+	# then uploads the data to your google powermeter account
+	# This script runs as a daemon (forks itself into the background) and can 
+	# be run using a system daemon controller like init.d. I have included a debian init.d script, use
+	# at your own risk though!
+
+	# Written by Nick Fox based on the original power meter uploader by stuart\@linux-depot.com with some code
+	from the script by Bruce S. Garlock http://currentcost.posterous.com/, Thanks guys
+
+	# if anything doesnt work, its probably permissions, its ALWAYS permissions!
+
+	# logging is pretty good, if you have any problems start there.
+	
+	# !!! 
+	# If you have never uploaded data to google powermeter you need to create an entity variable first. This is basically
+	# a container for the data you are uploading. The script accepts a flag that will send an instruction to your powermeter
+	# account to create an entity veriable. The script will then terminate. i.e.
+	# perl currentCostListener -C
+	# !!!
+
+	# XML documentation available from http://currentcost.com/cc128/xml.htm should also be included in a text file
+
+	# make sure you have all the modules installed esspecialy Crypt::SSLeay for LWP to talk to googles HTTPS
+	# try..
+	# sudo perl -MCPAN -e shell
+	# check with
+	# -> i Crypt::SSLeay
+	# if not installed do
+	# -> install Crypt::SSLeay
+	# this method can be used to install any other required modules
+	
+	# to use init.d on debian you need to add the daemon using update-rc.d
+	# this configures the script to run on boot (debian)
+	# update-rc.d mydaemon defaults 99
+	# to disable script from starting at boot
+	# update-rc.d -f mydaemon remove
+
+	";
+	die;
+}
+
+END {
+	&interrupt();
+}
+
+
+__END__ 
+
+
+# =========
+# = notes =
+# =========
+
+rsync -ave ssh --force currentcost/ nick@192.168.0.222:/home/nick/currentcost/
